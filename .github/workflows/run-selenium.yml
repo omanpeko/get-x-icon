@@ -7,7 +7,7 @@ on:
         description: 'CSV path (default: accounts.csv)'
         required: false
         default: 'accounts.csv'
-  # 定期実行したい場合は下を有効化（例：JST 12:30）
+  # 定期実行したい場合は有効化（例：JST 12:30 = UTC 03:30）
   # schedule:
   #   - cron: '30 3 * * *'
 
@@ -59,9 +59,10 @@ jobs:
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: |
           set -eux
-          python main.py "${{ github.event.inputs.csv_path || 'accounts.csv' }}"
+          CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
+          python main.py "$CSV_PATH"
           echo "--- head of updated CSV ---"
-          head -n 5 "${{ github.event.inputs.csv_path || 'accounts.csv' }}"
+          head -n 5 "$CSV_PATH"
 
       # ★ CI完了時にGASへ即反映（非公開RepoでもOK）
       - name: Post CSV to GAS
@@ -80,8 +81,8 @@ jobs:
           # 本文(JSON)に対して HMAC-SHA256(hex) 署名（openssl/xxdは標準で入ってます）
           SIG=$(printf '%s' "$JSON" | openssl dgst -sha256 -hmac "$GAS_SHARED_SECRET" -binary | xxd -p -c 256)
 
-          # 送信
-          curl -sS -X POST "$GAS_ENDPOINT" \
+          # 送信（ヘッダ + クエリの両方で署名を渡す）
+          curl -sS -X POST "${GAS_ENDPOINT}?signature=${SIG}" \
             -H "Content-Type: application/json" \
             -H "X-Signature: $SIG" \
             --data "$JSON"
