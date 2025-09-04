@@ -1,4 +1,4 @@
-name: Run Selenium scraper (PR)
+name: Run Selenium scraper (PR + Push to GAS)
 
 on:
   workflow_dispatch:
@@ -7,6 +7,7 @@ on:
         description: 'CSV path (default: accounts.csv)'
         required: false
         default: 'accounts.csv'
+  # 定期実行したい場合は下を有効化（例：JST 12:30）
   # schedule:
   #   - cron: '30 3 * * *'
 
@@ -14,8 +15,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
-      contents: write      # 変更コミットに必要
-      pull-requests: write # PR作成に必要
+      contents: write       # 変更コミット／PRのため
+      pull-requests: write  # PR作成のため
 
     steps:
       - name: Checkout
@@ -36,6 +37,7 @@ jobs:
         id: chrome
         uses: browser-actions/setup-chrome@v1
 
+      # 古いchromedriverがPATHに居ると不整合で落ちるので除去
       - name: Remove stale chromedriver from PATH
         run: |
           if command -v chromedriver; then
@@ -58,14 +60,41 @@ jobs:
         run: |
           set -eux
           python main.py "${{ github.event.inputs.csv_path || 'accounts.csv' }}"
+          echo "--- head of updated CSV ---"
+          head -n 5 "${{ github.event.inputs.csv_path || 'accounts.csv' }}"
 
+      # ★ CI完了時にGASへ即反映（非公開RepoでもOK）
+      - name: Post CSV to GAS
+        # 成功時だけ送りたいなら if: success() に変更
+        if: always()
+        env:
+          GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}
+          GAS_SHARED_SECRET: ${{ secrets.GAS_SHARED_SECRET }}
+        run: |
+          set -e
+          CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
+
+          # CSV全文をJSONへ（jq: ランナーに標準インストール済）
+          JSON=$(jq -Rs '{csvText: .}' < "$CSV_PATH")
+
+          # 本文(JSON)に対して HMAC-SHA256(hex) 署名（openssl/xxdは標準で入ってます）
+          SIG=$(printf '%s' "$JSON" | openssl dgst -sha256 -hmac "$GAS_SHARED_SECRET" -binary | xxd -p -c 256)
+
+          # 送信
+          curl -sS -X POST "$GAS_ENDPOINT" \
+            -H "Content-Type: application/json" \
+            -H "X-Signature: $SIG" \
+            --data "$JSON"
+
+      # 任意：成果物としてCSVを保存（ダウンロード用）
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: accounts.csv
-          path: accounts.csv
+          path: ${{ github.event.inputs.csv_path || 'accounts.csv' }}
 
+      # mainをクリーンに保つため、変更はPRで提案
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
@@ -75,4 +104,4 @@ jobs:
           branch: "ci/update-accounts-csv"
           delete-branch: true
           add-paths: |
-            accounts.csv
+            ${{ github.event.inputs.csv_path || 'accounts.csv' }}
