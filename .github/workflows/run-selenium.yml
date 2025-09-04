@@ -1,18 +1,21 @@
-name: Run Selenium scraper
+name: Run Selenium scraper (PR)
 
 on:
   workflow_dispatch:
     inputs:
       csv_path:
-        description: 'CSV path'
+        description: 'CSV path (default: accounts.csv)'
         required: false
         default: 'accounts.csv'
+  # schedule:
+  #   - cron: '30 3 * * *'
 
 jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write      # 変更コミットに必要
+      pull-requests: write # PR作成に必要
 
     steps:
       - name: Checkout
@@ -33,7 +36,6 @@ jobs:
         id: chrome
         uses: browser-actions/setup-chrome@v1
 
-      # ここがポイント：古い chromedriver を必ず除去
       - name: Remove stale chromedriver from PATH
         run: |
           if command -v chromedriver; then
@@ -54,13 +56,23 @@ jobs:
         env:
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: |
-          set -x
+          set -eux
           python main.py "${{ github.event.inputs.csv_path || 'accounts.csv' }}"
 
-      - name: Upload logs
+      - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: run-logs
-          path: |
+          name: accounts.csv
+          path: accounts.csv
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "Update accounts.csv via CI"
+          title: "Update accounts.csv"
+          body: "CI updated accounts.csv"
+          branch: "ci/update-accounts-csv"
+          delete-branch: true
+          add-paths: |
             accounts.csv
