@@ -1,51 +1,41 @@
-# ワークフロー名（Actions画面に表示される）
 name: Run Selenium scraper (PR + Push to GAS)
 
 on:
-  # 手動実行（Actions > Run workflow で走らせる）
   workflow_dispatch:
     inputs:
       csv_path:
         description: 'CSV path (default: accounts.csv)'
         required: false
         default: 'accounts.csv'
-  # 定期実行したい場合はコメントアウト解除（例：JST 12:30 = UTC 03:30）
   # schedule:
-  #   - cron: '30 3 * * *'
+  #   - cron: '30 3 * * *'  # 例：JST 12:30 (UTC 03:30)
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
-    # GITHUB_TOKEN の権限。PR作成するので pull-requests: write も付ける
     permissions:
       contents: write
       pull-requests: write
 
     steps:
-      # リポジトリのソースをチェックアウト
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Python セットアップ
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # 依存インストール（Seleniumは4.24+でSelenium Manager安定）
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install "selenium>=4.24.0,<5"
 
-      # Chrome 本体を入れる（browser-actions/setup-chrome）
       - name: Setup Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
 
-      # PATH 上の古い chromedriver を消して Selenium Manager に任せる
       - name: Remove stale chromedriver from PATH
         run: |
           if command -v chromedriver; then
@@ -56,17 +46,15 @@ jobs:
             echo "No chromedriver in PATH"
           fi
 
-      # 参考情報の出力（トラブル時の手掛かり）
       - name: Show versions (debug)
         run: |
           which google-chrome || true
           google-chrome --version || true
           python -c "import selenium, platform; print('selenium', selenium.__version__); print(platform.platform())"
 
-      # あなたの main.py を実行して CSV を更新
       - name: Run script
         env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}  # setup-chrome が出すパス
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: |
           set -eux
           CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
@@ -74,33 +62,30 @@ jobs:
           echo "--- head of updated CSV ---"
           head -n 5 "$CSV_PATH"
 
-      # ▼▼ ここから GAS へ Push（非公開Repoでも即反映） ▼▼
-      # GAS の /exec は POST 後に 302 を返すので「追わずに」Locationだけ拾い、
-      # そのURLを GET してレスポンスJSON（statusなど）をログに出す。
+      # ── GASにPush（302は仕様。LocationをGETしてレスポンスJSONを拾う）──
       - name: Post CSV to GAS (POST then capture response JSON)
-        if: always() # 失敗時も診断したいなら always / 成功時だけ送るなら success()
+        if: always()
         env:
-          GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}         # 例）https://script.google.com/macros/s/XXX/exec
-          GAS_SHARED_SECRET: ${{ secrets.GAS_SHARED_SECRET }} # GAS側と同じ共有鍵
+          GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}          # 例: https://script.google.com/macros/s/XXXX/exec
+          GAS_SHARED_SECRET: ${{ secrets.GAS_SHARED_SECRET }}# GASと同じ鍵
         run: |
           set -euo pipefail
-          # jq が無ければ入れる（ubuntu-latest だと大抵入ってる）
           command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
 
           CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
           test -f "$CSV_PATH" || { echo "::error::CSV not found at $CSV_PATH"; exit 2; }
 
-          # Secrets を安全に整形（改行/末尾スペース除去）
           GAS_ENDPOINT="$(printf '%s' "$GAS_ENDPOINT" | tr -d '\r\n' | sed 's/[[:space:]]\+$//')"
           GAS_SHARED_SECRET="$(printf '%s' "$GAS_SHARED_SECRET" | tr -d '\r\n')"
 
-          # CSV全文を JSON の csvText に詰める（改行も含めて丸ごと）
           JSON="$(jq -Rs '{csvText: .}' < "$CSV_PATH")"
-
-          # 本文(JSON)で HMAC-SHA256（hex）を計算（GASの署名検証と一致させる）
           SIG="$(printf '%s' "$JSON" | openssl dgst -sha256 -hmac "$GAS_SHARED_SECRET" -binary | xxd -p -c 256)"
 
-          # 署名をクエリにも付与（GASの e.parameter.signature で拾えるよう二重化）
+          # 参考: ローカル側の ping-HMAC と本文SHA
+          LOCAL_HMAC_PING="$(printf 'ping' | openssl dgst -sha256 -hmac "$GAS_SHARED_SECRET" -binary | xxd -p -c 256)"
+          LOCAL_BODY_SHA="$(printf '%s' "$JSON" | openssl dgst -sha256 -binary | xxd -p -c 256)"
+
+          # 署名をクエリにも付与（GAS側で拾いやすい）
           if echo "$GAS_ENDPOINT" | grep -q '?'; then
             URL="${GAS_ENDPOINT}&signature=${SIG}"
           else
@@ -110,6 +95,8 @@ jobs:
           echo "Posting to: $(echo "$GAS_ENDPOINT" | awk -F/ '{print $1"//"$3}') ..."
           echo "CSV bytes: $(wc -c < "$CSV_PATH")"
           echo "Local SIG (head16): ${SIG:0:16}"
+          echo "Local hmacPing (head16): ${LOCAL_HMAC_PING:0:16}"
+          echo "Local bodySha (head16): ${LOCAL_BODY_SHA:0:16}"
 
           # 1) POST（リダイレクトは追わない）→ Location を取得
           POST_CODE=$(curl -sS -o /dev/null -D headers.txt -w "%{http_code}" \
@@ -121,7 +108,7 @@ jobs:
           LOC=$(grep -i '^Location:' headers.txt | awk '{print $2}' | tr -d '\r')
           echo "Location: ${LOC:-<none>}"
 
-          # 2) Location があれば GET でレスポンスJSONを回収（GAS側で _resp が返すjson）
+          # 2) Location があれば GET でレスポンスJSONを回収
           if [ -n "${LOC:-}" ]; then
             GET_CODE=$(curl -sS -o response.json -w "%{http_code}" "$LOC")
             echo "GET HTTP $GET_CODE"
@@ -130,14 +117,12 @@ jobs:
             echo "No Location header; cannot fetch JSON body (but doPost should have executed)."
           fi
 
-          # 成否の判断はお好みで。
-          # ここでは POST が 200/302 以外なら失敗扱いにする（GASの仕様では通常302）
+          # 200/302 を成功扱い（GASは通常302）
           if [ "$POST_CODE" != "200" ] && [ "$POST_CODE" != "302" ]; then
             echo "::error::GAS POST returned HTTP $POST_CODE"
             exit 1
           fi
 
-      # 任意：成果物としてCSVを保存（ダウンロード用途）
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -145,14 +130,13 @@ jobs:
           name: accounts.csv
           path: ${{ github.event.inputs.csv_path || 'accounts.csv' }}
 
-      # main をクリーンに保つ：変更は PR で提案（保護ブランチでもOK）
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
           commit-message: "Update accounts.csv via CI"
           title: "Update accounts.csv"
           body: "CI updated accounts.csv"
-          branch: "ci/update-accounts-csv"  # 作業用ブランチ名
+          branch: "ci/update-accounts-csv"
           delete-branch: true
           add-paths: |
             ${{ github.event.inputs.csv_path || 'accounts.csv' }}
