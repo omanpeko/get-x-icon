@@ -65,14 +65,13 @@ jobs:
           head -n 5 "$CSV_PATH"
 
       # ★ CI完了時にGASへ即反映（非公開RepoでもOK）
-      - name: Post CSV to GAS (no redirect follow; accept 302)
+      - name: Post CSV to GAS (capture JSON via redirect GET)
         if: always()
         env:
           GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}
           GAS_SHARED_SECRET: ${{ secrets.GAS_SHARED_SECRET }}
         run: |
           set -euo pipefail
-      
           command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
       
           CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
@@ -84,7 +83,7 @@ jobs:
           JSON="$(jq -Rs '{csvText: .}' < "$CSV_PATH")"
           SIG="$(printf '%s' "$JSON" | openssl dgst -sha256 -hmac "$GAS_SHARED_SECRET" -binary | xxd -p -c 256)"
       
-          # 署名はクエリにも付ける（GAS側で拾いやすい）
+          # 署名をクエリにも付与
           if echo "$GAS_ENDPOINT" | grep -q '?'; then
             URL="${GAS_ENDPOINT}&signature=${SIG}"
           else
@@ -94,26 +93,24 @@ jobs:
           echo "Posting to: $(echo "$GAS_ENDPOINT" | awk -F/ '{print $1"//"$3}') ..."
           echo "CSV bytes: $(wc -c < "$CSV_PATH")"
       
-          # 302を追従しない。レスポンスHTMLでもOK。doPostは実行済み。
-          HTTP_CODE=$(curl -sS -o response.html -D headers.txt -w "%{http_code}" \
+          # 1) POST（リダイレクトは追わない）→ Location を取得
+          HTTP_CODE=$(curl -sS -o /dev/null -D headers.txt -w "%{http_code}" \
             -X POST "$URL" \
             -H "Content-Type: application/json" \
             -H "X-Signature: $SIG" \
             --data "$JSON")
+          echo "POST HTTP $HTTP_CODE"
+          LOC=$(grep -i '^Location:' headers.txt | awk '{print $2}' | tr -d '\r')
+          echo "Location: ${LOC:-<none>}"
       
-          echo "HTTP $HTTP_CODE"
-          echo "Location (if any):"; grep -i '^Location:' headers.txt || true
-      
-          # 200 or 302 を成功扱い
-          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ]; then
-            echo "GAS accepted POST (doPost executed)."
+          # 2) Location があれば GET で本文を回収（GASのJSON）
+          if [ -n "${LOC:-}" ]; then
+            GET_CODE=$(curl -sS -o response.json -w "%{http_code}" "$LOC")
+            echo "GET HTTP $GET_CODE"
+            echo "Response body:" && cat response.json || true
           else
-            echo "Response body:" && tail -n +1 response.html
-            echo "::error::GAS returned HTTP $HTTP_CODE"
-            exit 1
+            echo "No Location header; cannot fetch JSON body."
           fi
-
-
 
       # 任意：成果物としてCSVを保存（ダウンロード用）
       - name: Upload artifact
