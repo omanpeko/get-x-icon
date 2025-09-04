@@ -65,62 +65,47 @@ jobs:
           head -n 5 "$CSV_PATH"
 
       # ★ CI完了時にGASへ即反映（非公開RepoでもOK）
-      - name: Post CSV to GAS (hardened)
+      - name: Post CSV to GAS (follow redirect)
         if: always()
         env:
           GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}
           GAS_SHARED_SECRET: ${{ secrets.GAS_SHARED_SECRET }}
         run: |
           set -euo pipefail
-
-          # 1) 依存コマンドの存在チェック（念のため）
+      
+          # 依存確認（Ubuntuなら大抵入ってます）
           command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
-          command -v openssl >/dev/null || (echo "openssl not found" && exit 2)
-          command -v curl >/dev/null || (echo "curl not found" && exit 2)
-
-          # 2) CSVパス確定＆存在チェック
+      
           CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
           test -f "$CSV_PATH" || { echo "::error::CSV not found at $CSV_PATH"; exit 2; }
-
-          # 3) Secrets の存在チェック
-          if [ -z "${GAS_ENDPOINT:-}" ]; then
-            echo "::error::GAS_ENDPOINT secret is empty"; exit 2
-          fi
-          if [ -z "${GAS_SHARED_SECRET:-}" ]; then
-            echo "::error::GAS_SHARED_SECRET secret is empty"; exit 2
-          fi
-
-          # 4) 余計な改行や空白を除去（URL malformed 対策）
+      
+          # 余計な空白・改行を除去
           GAS_ENDPOINT="$(printf '%s' "$GAS_ENDPOINT" | tr -d '\r\n' | sed 's/[[:space:]]\+$//')"
           GAS_SHARED_SECRET="$(printf '%s' "$GAS_SHARED_SECRET" | tr -d '\r\n')"
-
-          # 5) JSON化（CSV全文を格納）
+      
           JSON="$(jq -Rs '{csvText: .}' < "$CSV_PATH")"
-
-          # 6) HMAC-SHA256 署名（hex）
           SIG="$(printf '%s' "$JSON" | openssl dgst -sha256 -hmac "$GAS_SHARED_SECRET" -binary | xxd -p -c 256)"
-
-          # 7) 署名クエリを付与（既に?がある/ないに対応）
+      
+          # ?signature= を付与（ヘッダにも送る）
           if echo "$GAS_ENDPOINT" | grep -q '?'; then
             URL="${GAS_ENDPOINT}&signature=${SIG}"
           else
             URL="${GAS_ENDPOINT}?signature=${SIG}"
           fi
-
-          # 8) デバッグ出力（URLはホスト部だけ表示）
+      
           echo "Posting to: $(echo "$GAS_ENDPOINT" | awk -F/ '{print $1"//"$3}') ..."
           echo "CSV bytes: $(wc -c < "$CSV_PATH")"
-
-          # 9) 送信（HTTPコードも表示）
-          HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" \
+      
+          # -L: リダイレクト追従, --post302/--post301: 302/301でもPOST維持
+          HTTP_CODE=$(curl -sS -L --post302 --post301 -o response.json -w "%{http_code}" \
             -X POST "$URL" \
             -H "Content-Type: application/json" \
             -H "X-Signature: $SIG" \
-            --data "$JSON" )
+            --data "$JSON")
+      
           echo "HTTP $HTTP_CODE"
           echo "Response body:" && cat response.json
-
-          # 10) HTTPコード確認（200以外は失敗扱いにしたい場合はここで落とす）
+      
           [ "$HTTP_CODE" = "200" ] || { echo "::error::GAS returned HTTP $HTTP_CODE"; exit 1; }
 
 
