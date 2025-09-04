@@ -1,4 +1,3 @@
-# main.py
 import csv
 import time
 import random
@@ -8,7 +7,7 @@ import os
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-# from selenium.webdriver.common.desired_capabilities import DesiredCapabilities  # ←不要
+
 
 # 画像サイズを 400x400 に寄せる
 def to_400(url: str) -> str:
@@ -17,6 +16,8 @@ def to_400(url: str) -> str:
     url = re.sub(r'_(normal|200x200|bigger)', '_400x400', url)
     return url
 
+
+# ld+json から抽出（author / mainEntity 両対応）
 def extract_from_ldjson(html: str):
     try:
         blocks = re.findall(
@@ -53,6 +54,8 @@ def extract_from_ldjson(html: str):
         pass
     return None
 
+
+# <img> から抽出（保険）
 def extract_from_img_tag(html: str):
     m = re.search(
         r'<img[^>]+src="(https://pbs\.twimg\.com/profile_images/[^"]+?_400x400\.(?:jpg|png))"',
@@ -69,6 +72,8 @@ def extract_from_img_tag(html: str):
         return to_400(m2.group(1))
     return None
 
+
+# Networkログから抽出（最後の保険）
 def extract_from_network_logs(driver):
     try:
         logs = driver.get_log("performance")
@@ -98,14 +103,14 @@ def extract_from_network_logs(driver):
             return fixed
     return None
 
+
+# HTML取得
 def get_html_content(account_id):
     options = Options()
-    # CI向け（ヘッドレス & 実行環境のChromeを使用）
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=800,600")
-    options.add_argument("--window-position=-10000,-10000")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
@@ -114,12 +119,11 @@ def get_html_content(account_id):
                          "AppleWebKit/537.36 (KHTML, like Gecko) "
                          "Chrome/120.0.0.0 Safari/537.36")
 
-    # GitHub Actions で browser-actions/setup-chrome が出すパスに対応
+    # ActionsなどでCHROME_PATHが指定されている場合に利用
     chrome_path = os.environ.get("CHROME_PATH") or os.environ.get("GOOGLE_CHROME_SHIM")
     if chrome_path:
         options.binary_location = chrome_path
 
-    # network log 有効化
     options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
     driver = webdriver.Chrome(options=options)
@@ -147,6 +151,8 @@ def get_html_content(account_id):
             pass
         return None, None
 
+
+# URL解決
 def resolve_profile_image_url(account_id):
     driver, html = get_html_content(account_id)
     if not driver:
@@ -168,27 +174,47 @@ def resolve_profile_image_url(account_id):
         except Exception:
             pass
 
+
+# CSV処理（Profile Image URL列を毎回上書き）
 def process_csv(file_path):
     with open(file_path, "r", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        header = next(reader)
-        rows = [row for row in reader]
+        reader = list(csv.reader(f))
 
-    for row in rows:
+    if not reader:
+        print("CSV is empty.")
+        return
+
+    header = reader[0]
+    rows = reader[1:]
+
+    # Profile Image URL列のインデックスを確認・追加
+    if "Profile Image URL" not in header:
+        header.append("Profile Image URL")
+    url_index = header.index("Profile Image URL")
+
+    for i, row in enumerate(rows):
+        if not row:
+            continue
         account_id = row[0].strip()
         print(f"\nProcessing {account_id} ...")
         url = resolve_profile_image_url(account_id)
         if url:
             print(f" -> {url}")
-            row.append(url)
         else:
             print(" -> Failed to fetch URL")
-            row.append("Failed to fetch URL")
+            url = "Failed to fetch URL"
+
+        # 行の長さを揃えて上書き
+        if len(row) <= url_index:
+            row += [""] * (url_index + 1 - len(row))
+        row[url_index] = url
+        rows[i] = row
 
     with open(file_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(header + ["Profile Image URL"])
+        writer.writerow(header)
         writer.writerows(rows)
+
 
 if __name__ == "__main__":
     csv_file_path = "accounts.csv"
