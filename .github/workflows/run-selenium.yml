@@ -7,58 +7,63 @@ on:
         description: 'CSV path'
         required: false
         default: 'accounts.csv'
-  schedule:
-    # 毎日 03:30 UTC 実行（JST 12:30）
-    - cron: '30 3 * * *'
 
 jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # 結果をコミットする場合に必要
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Show repo tree (debug)
+        run: |
+          pwd
+          ls -la
+          if [ -f "${{ github.event.inputs.csv_path || 'accounts.csv' }}" ]; then
+            echo "CSV found:" ${{ github.event.inputs.csv_path || 'accounts.csv' }}
+            head -n 5 ${{ github.event.inputs.csv_path || 'accounts.csv' }}
+          else
+            echo "CSV NOT FOUND"
+          fi
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-            python-version: '3.11'
-            cache: 'pip'
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install selenium==4.23.1
 
-      # Chrome本体をセットアップ
+      # Chrome本体だけ入れる（Selenium Managerで自動的に適合したDriverを取らせる）
       - name: Setup Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
 
-      # ChromedriverをPATHに追加
-      - name: Setup Chromedriver
-        uses: nanasess/setup-chromedriver@v2
+      - name: Show versions (debug)
+        run: |
+          which google-chrome || true
+          google-chrome --version || true
+          python -c "import selenium, platform; print('selenium', selenium.__version__); print(platform.platform())"
 
       - name: Run script
         env:
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: |
-          python main.py "${{ github.event.inputs.csv_path || 'accounts.csv' }}"
+          set -x
+          python main.py "${{ github.event.inputs.csv_path || 'accounts.csv' }}" 2>&1 | tee run.log
 
-      # ① 結果CSVを成果物に添付（ダウンロード派はこちら）
-      - name: Upload artifact
+      # 失敗してもログを見たいので成果物を必ず残す
+      - name: Upload logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: accounts.csv
-          path: accounts.csv
-
-      # ② 直接コミットしてリポジトリに反映（こちらもしたい場合）
-      - name: Commit & push updated CSV
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add accounts.csv
-          git commit -m "Update accounts.csv via CI" || echo "No changes"
-          git push
+          name: run-logs
+          path: |
+            run.log
+            accounts.csv
