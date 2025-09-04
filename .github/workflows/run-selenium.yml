@@ -65,7 +65,7 @@ jobs:
           head -n 5 "$CSV_PATH"
 
       # ★ CI完了時にGASへ即反映（非公開RepoでもOK）
-      - name: Post CSV to GAS (capture JSON via redirect GET)
+      - name: Post CSV to GAS (no redirect follow; accept 302)
         if: always()
         env:
           GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}
@@ -92,6 +92,7 @@ jobs:
       
           echo "Posting to: $(echo "$GAS_ENDPOINT" | awk -F/ '{print $1"//"$3}') ..."
           echo "CSV bytes: $(wc -c < "$CSV_PATH")"
+          echo "Local SIG (head16): ${SIG:0:16}"
       
           # 1) POST（リダイレクトは追わない）→ Location を取得
           HTTP_CODE=$(curl -sS -o /dev/null -D headers.txt -w "%{http_code}" \
@@ -103,7 +104,7 @@ jobs:
           LOC=$(grep -i '^Location:' headers.txt | awk '{print $2}' | tr -d '\r')
           echo "Location: ${LOC:-<none>}"
       
-          # 2) Location があれば GET で本文を回収（GASのJSON）
+          # 2) Location があれば GET でレスポンスJSONを回収
           if [ -n "${LOC:-}" ]; then
             GET_CODE=$(curl -sS -o response.json -w "%{http_code}" "$LOC")
             echo "GET HTTP $GET_CODE"
@@ -111,6 +112,7 @@ jobs:
           else
             echo "No Location header; cannot fetch JSON body."
           fi
+
 
       # 任意：成果物としてCSVを保存（ダウンロード用）
       - name: Upload artifact
