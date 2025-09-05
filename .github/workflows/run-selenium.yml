@@ -73,30 +73,26 @@ jobs:
           google-chrome --version || true
           python -c "import selenium, platform; print('selenium', selenium.__version__); print(platform.platform())"
 
-      # 7) ids が与えられていたら、そのまま accounts.csv を生成（※正規化はGAS側で実施）
-      - name: Build accounts.csv from ids (no normalization)
+      # 7) ids が与えられていたら、そのまま accounts.csv を生成（正規化はしない／Python不使用）
+      - name: Build accounts.csv from ids (no normalization, no Python)
         run: |
           set -eux
           IDS_INPUT="${{ github.event.inputs.ids }}"
           if [ -n "$IDS_INPUT" ]; then
-            # 環境変数経由で Python に渡す（heredoc の展開混線を避ける）
-            export IDS="$IDS_INPUT"
-            python - << 'PY'
-import os, csv, sys
-raw = os.environ.get("IDS", "")
-# 改行で分割、前後空白を削って空行は捨てる（※正規化はしない）
-ids = [line.strip() for line in raw.splitlines() if line.strip()]
-
-with open("accounts.csv", "w", encoding="utf-8", newline="") as f:
-    w = csv.writer(f)
-    w.writerow(["Account ID"])
-    for x in ids:
-        w.writerow([x])
-
-print("Built accounts.csv with", len(ids), "rows")
-PY
+            # ヘッダ
+            printf 'Account ID\n' > accounts.csv
+            # 改行で分割 → \r除去 → 前後空白トリム → 空行除去 → CSVクオートして追記
+            printf '%s\n' "$IDS_INPUT" \
+            | tr -d '\r' \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+            | awk 'NF' \
+            | while IFS= read -r line; do
+                # CSVエスケープ：ダブルクォートを "" に置換し、全体を "..." で囲む
+                esc="${line//\"/\"\"}"
+                printf '"%s"\n' "$esc" >> accounts.csv
+              done
             echo "accounts.csv content:"
-            cat accounts.csv
+            head -n 10 accounts.csv || true
           fi
 
       # 8) あなたの main.py を実行して CSV を更新
