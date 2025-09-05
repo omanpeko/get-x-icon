@@ -1,25 +1,27 @@
-# Actions 上の表示名
-name: Run Selenium scraper (PR + Push to GAS)
+# Actions 上の表示名（ワークフロー一覧に出る名前）
+name: "Run Selenium scraper (PR + Push to GAS)"
+# 各実行（Run）タイトル（任意）
+run-name: "Run by ${{ github.actor }} • ${{ github.event_name }}"
 
 on:
-  # 手動実行（Actions 画面から Run）
+  # 手動実行（Actions画面からRun）
   workflow_dispatch:
     inputs:
       csv_path:
-        description: 'CSV path (default: accounts.csv)'
+        description: "CSV path (default: accounts.csv)"
         required: false
-        default: 'accounts.csv'
+        default: "accounts.csv"
       ids:
-        description: 'Account IDs (one per line). If set, overrides csv_path.'
+        description: "Account IDs (one per line). If set, overrides csv_path."
         required: false
-        default: ''
+        default: ""
       target:
         description: 'Where to write at GAS: "list" or "database"'
         required: false
-        default: 'database'
+        default: "database"
   # 定期実行したいなら cron を有効化（例はUTC 03:30=JST 12:30）
   # schedule:
-  #   - cron: '30 3 * * *'
+  #   - cron: "30 3 * * *"
 
 jobs:
   run:
@@ -31,16 +33,16 @@ jobs:
       pull-requests: write
 
     steps:
-      # 1) リポジトリのコードを取得
+      # 1) リポジトリのコード取得
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Python 3.11 を用意（pip キャッシュ有効）
+      # 2) Python 3.11 を用意（pipキャッシュ有効）
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
 
       # 3) 依存インストール（Selenium 4.24+）
       - name: Install deps
@@ -48,12 +50,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install "selenium>=4.24.0,<5"
 
-      # 4) Chrome のセットアップ（Selenium が使う実ブラウザ）
+      # 4) Chrome をセットアップ（Selenium が使う実ブラウザ）
       - name: Setup Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
 
-      # 5) PATH 上の古い chromedriver は削除（Selenium Manager に任せるため）
+      # 5) PATH上の古い chromedriver を除去（Selenium Manager に任せる）
       - name: Remove stale chromedriver from PATH
         run: |
           if command -v chromedriver; then
@@ -64,58 +66,32 @@ jobs:
             echo "No chromedriver in PATH"
           fi
 
-      # 6) デバッグ用にバージョン情報を出力
+      # 6) デバッグ用にバージョンを表示
       - name: Show versions (debug)
         run: |
           which google-chrome || true
           google-chrome --version || true
           python -c "import selenium, platform; print('selenium', selenium.__version__); print(platform.platform())"
 
-      # 7) ids が与えられていたら、正規化して accounts.csv を生成（環境変数経由で安全に受け渡し）
-      #    正規化ルール：
-      #     - 先頭の @ を除去
-      #     - URL (https://x.com/<id> 形式) なら最初のパスセグメントを抽出
-      #     - ? 以降のクエリを除去
-      - name: Build accounts.csv from ids (normalized if provided)
+      # 7) ids が与えられていたら、そのまま accounts.csv を生成（※正規化はGAS側で実施）
+      - name: Build accounts.csv from ids (no normalization)
         run: |
           set -eux
           IDS_INPUT="${{ github.event.inputs.ids }}"
           if [ -n "$IDS_INPUT" ]; then
+            # 環境変数経由で Python に渡す（heredoc の展開混線を避ける）
             export IDS="$IDS_INPUT"
             python - << 'PY'
-import os
-from urllib.parse import urlparse
-
-raw = os.environ.get("IDS", "").splitlines()
-
-def norm(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return ""
-    if s.startswith("@"):
-        s = s[1:]
-    if s.lower().startswith(("http://", "https://")):
-        try:
-            u = urlparse(s)
-            parts = [p for p in u.path.split("/") if p]
-            if parts:
-                s = parts[0]
-        except Exception:
-            pass
-    if "?" in s:
-        s = s.split("?", 1)[0]
-    return s.strip()
-
-ids = []
-for line in raw:
-    t = norm(line)
-    if t:
-        ids.append(t)
+import os, csv, sys
+raw = os.environ.get("IDS", "")
+# 改行で分割、前後空白を削って空行は捨てる（※正規化はしない）
+ids = [line.strip() for line in raw.splitlines() if line.strip()]
 
 with open("accounts.csv", "w", encoding="utf-8", newline="") as f:
-    f.write("Account ID\n")
+    w = csv.writer(f)
+    w.writerow(["Account ID"])
     for x in ids:
-        f.write(f"{x}\n")
+        w.writerow([x])
 
 print("Built accounts.csv with", len(ids), "rows")
 PY
@@ -137,14 +113,14 @@ PY
           fi
           python main.py "$CSV_PATH"
           echo "--- head of updated CSV ---"
-          head -n 5 "$CSV_PATH"
+          head -n 5 "$CSV_PATH" || true
 
       # 9) GAS に CSV を Push（token 認証・target 指定）
       - name: Post CSV to GAS (simple token / target switch)
         if: always()
         env:
           GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}   # 例: https://script.google.com/macros/s/XXXX/exec
-          GAS_TOKEN:    ${{ secrets.GAS_TOKEN }}      # GAS 側のトークンと一致
+          GAS_TOKEN:    ${{ secrets.GAS_TOKEN }}      # GAS 側のトークン（GASの SHARED_TOKEN と一致）
         run: |
           set -euo pipefail
           command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
@@ -182,6 +158,7 @@ PY
             --data-binary @payload.json)
           echo "POST HTTP $POST_CODE"
 
+          # 302 の場合、リダイレクト先をGETして応答本文も念のためログに出す
           LOC=$(grep -i '^Location:' headers.txt | awk '{print $2}' | tr -d '\r')
           if [ -n "${LOC:-}" ]; then
             GET_CODE=$(curl -sS -o response.json -w "%{http_code}" "$LOC")
