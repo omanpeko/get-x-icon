@@ -1,6 +1,15 @@
+# =========================================================
+# ワークフロー表示名（一覧に出る名前）
+# =========================================================
 name: "Run Selenium scraper (PR + Push to GAS)"
-run-name: "Run by ${ { github.actor } } • ${ { github.event_name } }"
+# 各実行（Run）のタイトル（任意）
+run-name: "Run by ${{ github.actor }} • ${{ github.event_name }}"
 
+# =========================================================
+# 手動実行トリガ（workflow_dispatch）
+#   - ids が指定された場合：シートからの実行モード（CSVは作らず、自前生成）
+#   - ids が空の場合      ：リポ内の csv_path を使用（従来モード）
+# =========================================================
 on:
   workflow_dispatch:
     inputs:
@@ -16,36 +25,59 @@ on:
         description: 'Where to write at GAS: "list" or "database"'
         required: false
         default: "database"
+  # 定期実行したいなら cron を有効化（例はUTC 03:30=JST 12:30）
+  # schedule:
+  #   - cron: "30 3 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
+    # =====================================================
+    # リポジトリへの書き込み/PR 作成に必要な権限
+    # =====================================================
     permissions:
       contents: write
       pull-requests: write
 
     steps:
-      - name: Checkout
+      # ---------------------------------------------------
+      # [STEP 1] リポジトリのコードを取得
+      # ---------------------------------------------------
+      - name: ⛳ Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      # ---------------------------------------------------
+      # [STEP 2] Python をセットアップ（3.11、pipキャッシュ）
+      # ---------------------------------------------------
+      - name: 🐍 Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install deps
+      # ---------------------------------------------------
+      # [STEP 3] 依存インストール（Selenium 4.24+）
+      # ---------------------------------------------------
+      - name: 📦 Install Python deps
         run: |
+          set -eux
           python -m pip install --upgrade pip
           pip install "selenium>=4.24.0,<5"
 
-      - name: Setup Chrome
+      # ---------------------------------------------------
+      # [STEP 4] Chrome をセットアップ（Seleniumが操作する実ブラウザ）
+      # ---------------------------------------------------
+      - name: 🧩 Setup Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
 
-      - name: Remove stale chromedriver from PATH
+      # ---------------------------------------------------
+      # [STEP 5] 古い chromedriver をPATHから除去（Selenium Managerに任せる）
+      # ---------------------------------------------------
+      - name: 🧹 Remove stale chromedriver from PATH
         run: |
+          set -eux
           if command -v chromedriver; then
             echo "Found chromedriver at: $(which chromedriver)"
             sudo rm -f "$(which chromedriver)"
@@ -54,16 +86,25 @@ jobs:
             echo "No chromedriver in PATH"
           fi
 
-      - name: Show versions (debug)
+      # ---------------------------------------------------
+      # [STEP 6] バージョン情報の出力（デバッグ用）
+      # ---------------------------------------------------
+      - name: 🔎 Show versions (debug)
         run: |
+          set -eux
           which google-chrome || true
           google-chrome --version || true
           python -c "import selenium, platform; print('selenium', selenium.__version__); print(platform.platform())"
 
-      # ★ここが肝：ids が来ていれば、その内容だけで accounts.csv を作る（正規化はしない）
-      - name: Build accounts.csv from ids (no normalization, no Python)
+      # ---------------------------------------------------
+      # [STEP 7] シート起動モード（idsあり）のみ：
+      #          受け取った ids から accounts.csv を生成
+      #          ※正規化は GAS 側で実施する想定。ここでは空行除去＆トリムのみ。
+      # ---------------------------------------------------
+      - name: 🧾 Build accounts.csv from ids (no normalization, no Python)
         run: |
           set -eux
+          echo "=== STEP 7: Build accounts.csv from ids (if provided) ==="
           IDS_INPUT="${{ github.event.inputs.ids }}"
           if [ -n "$IDS_INPUT" ]; then
             printf 'Account ID\n' > accounts.csv
@@ -75,19 +116,25 @@ jobs:
                 esc="${line//\"/\"\"}"
                 printf '"%s"\n' "$esc" >> accounts.csv
               done
-            echo "Built accounts.csv from ids:"
-            head -n 10 accounts.csv || true
+            echo "Built accounts.csv from provided ids:"
+            cat accounts.csv
           else
-            echo "No ids provided; will use csv_path input."
+            echo "No ids provided; will use csv_path input in the next step."
           fi
 
-      - name: Run script
+      # ---------------------------------------------------
+      # [STEP 8] スクレイパー実行：
+      #          - ids あり  → 直前に生成した accounts.csv を使用
+      #          - ids なし  → inputs.csv_path（例: accounts.csv）を使用
+      # ---------------------------------------------------
+      - name: 🏃 Run scraper (main.py)
         env:
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: |
           set -eux
+          echo "=== STEP 8: Run main.py ==="
           if [ -n "${{ github.event.inputs.ids }}" ]; then
-            CSV_PATH="accounts.csv"   # ← ids優先：リポのCSVは使わない
+            CSV_PATH="accounts.csv"   # ← シート起動：リポのCSVは参照しない
           else
             CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
           fi
@@ -96,13 +143,20 @@ jobs:
           echo "--- head of updated CSV ---"
           head -n 5 "$CSV_PATH" || true
 
-      - name: Post CSV to GAS (simple token / target switch)
+      # ---------------------------------------------------
+      # [STEP 9] GAS に CSV を Push（token 認証／target 指定）
+      #          - target = list     → シート「リスト」B列に反映
+      #          - target = database → シート「データベース」に全貼り
+      # ---------------------------------------------------
+      - name: 📤 Post CSV to GAS (token + target)
         if: always()
         env:
-          GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}
-          GAS_TOKEN:    ${{ secrets.GAS_TOKEN }}
+          GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}   # 例: https://script.google.com/macros/s/XXXX/exec
+          GAS_TOKEN:    ${{ secrets.GAS_TOKEN }}      # GAS側 SHARED_TOKEN と一致させる
         run: |
           set -euo pipefail
+          echo "=== STEP 9: Post CSV to GAS ==="
+
           command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
 
           if [ -n "${{ github.event.inputs.ids }}" ]; then
@@ -112,27 +166,32 @@ jobs:
           fi
           TARGET="${{ github.event.inputs.target || 'database' }}"
 
+          # Secretsの末尾改行/空白を除去
           GAS_ENDPOINT="$(printf '%s' "$GAS_ENDPOINT" | tr -d '\r\n' | sed 's/[[:space:]]\+$//')"
           GAS_TOKEN="$(printf '%s' "$GAS_TOKEN" | tr -d '\r\n')"
 
+          # URL エンコード
           ENC_TOKEN=$(printf '%s' "$GAS_TOKEN" | jq -sRr @uri)
           ENC_TARGET=$(printf '%s' "$TARGET" | jq -sRr @uri)
 
+          # CSV全文を JSON の csvText に詰める
           jq -Rs '{csvText: .}' < "$CSV_PATH" > payload.json
 
+          # token と target をクエリに付与
           if echo "$GAS_ENDPOINT" | grep -q '?'; then
             URL="${GAS_ENDPOINT}&token=${ENC_TOKEN}&target=${ENC_TARGET}"
           else
             URL="${GAS_ENDPOINT}?token=${ENC_TOKEN}&target=${ENC_TARGET}"
           fi
 
-          echo "Posting to GAS (target=${TARGET})..."
+          echo "Posting to: $URL"
           POST_CODE=$(curl -sS -o /dev/null -D headers.txt -w "%{http_code}" \
             -X POST "$URL" \
             -H "Content-Type: application/json" \
             --data-binary @payload.json)
           echo "POST HTTP $POST_CODE"
 
+          # 302 の場合はリダイレクト先も確認してログに残す
           LOC=$(grep -i '^Location:' headers.txt | awk '{print $2}' | tr -d '\r')
           if [ -n "${LOC:-}" ]; then
             GET_CODE=$(curl -sS -o response.json -w "%{http_code}" "$LOC")
@@ -145,7 +204,10 @@ jobs:
             exit 1
           fi
 
-      - name: Upload artifact
+      # ---------------------------------------------------
+      # [STEP 10] 生成CSVを Artifact として保管（ダウンロード用途）
+      # ---------------------------------------------------
+      - name: 📦 Upload artifact (accounts.csv)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -153,8 +215,10 @@ jobs:
           path: |
             ${{ github.event.inputs.ids && 'accounts.csv' || (github.event.inputs.csv_path || 'accounts.csv') }}
 
-      # ★ids 実行時はPRを出さない（リポのCSVを汚さない）
-      - name: Create Pull Request
+      # ---------------------------------------------------
+      # [STEP 11] PR作成（ids が空のときのみ＝リポ運用モード）
+      # ---------------------------------------------------
+      - name: 🔀 Create Pull Request (only when csv_path mode)
         if: ${{ !github.event.inputs.ids }}
         uses: peter-evans/create-pull-request@v6
         with:
