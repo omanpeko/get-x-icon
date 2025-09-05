@@ -1,10 +1,7 @@
-# Actions 上の表示名（ワークフロー一覧に出る名前）
 name: "Run Selenium scraper (PR + Push to GAS)"
-# 各実行（Run）タイトル（任意）
-run-name: "Run by ${{ github.actor }} • ${{ github.event_name }}"
+run-name: "Run by ${ { github.actor } } • ${ { github.event_name } }"
 
 on:
-  # 手動実行（Actions画面からRun）
   workflow_dispatch:
     inputs:
       csv_path:
@@ -19,43 +16,34 @@ on:
         description: 'Where to write at GAS: "list" or "database"'
         required: false
         default: "database"
-  # 定期実行したいなら cron を有効化（例はUTC 03:30=JST 12:30）
-  # schedule:
-  #   - cron: "30 3 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
-    # リポジトリへの書き込み/PR 作成に必要
     permissions:
       contents: write
       pull-requests: write
 
     steps:
-      # 1) リポジトリのコード取得
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Python 3.11 を用意（pipキャッシュ有効）
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      # 3) 依存インストール（Selenium 4.24+）
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install "selenium>=4.24.0,<5"
 
-      # 4) Chrome をセットアップ（Selenium が使う実ブラウザ）
       - name: Setup Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
 
-      # 5) PATH上の古い chromedriver を除去（Selenium Manager に任せる）
       - name: Remove stale chromedriver from PATH
         run: |
           if command -v chromedriver; then
@@ -66,62 +54,57 @@ jobs:
             echo "No chromedriver in PATH"
           fi
 
-      # 6) デバッグ用にバージョンを表示
       - name: Show versions (debug)
         run: |
           which google-chrome || true
           google-chrome --version || true
           python -c "import selenium, platform; print('selenium', selenium.__version__); print(platform.platform())"
 
-      # 7) ids が与えられていたら、そのまま accounts.csv を生成（正規化はしない／Python不使用）
+      # ★ここが肝：ids が来ていれば、その内容だけで accounts.csv を作る（正規化はしない）
       - name: Build accounts.csv from ids (no normalization, no Python)
         run: |
           set -eux
           IDS_INPUT="${{ github.event.inputs.ids }}"
           if [ -n "$IDS_INPUT" ]; then
-            # ヘッダ
             printf 'Account ID\n' > accounts.csv
-            # 改行で分割 → \r除去 → 前後空白トリム → 空行除去 → CSVクオートして追記
             printf '%s\n' "$IDS_INPUT" \
             | tr -d '\r' \
             | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
             | awk 'NF' \
             | while IFS= read -r line; do
-                # CSVエスケープ：ダブルクォートを "" に置換し、全体を "..." で囲む
                 esc="${line//\"/\"\"}"
                 printf '"%s"\n' "$esc" >> accounts.csv
               done
-            echo "accounts.csv content:"
+            echo "Built accounts.csv from ids:"
             head -n 10 accounts.csv || true
+          else
+            echo "No ids provided; will use csv_path input."
           fi
 
-      # 8) あなたの main.py を実行して CSV を更新
       - name: Run script
         env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}  # setup-chrome の出力
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: |
           set -eux
-          # ids が指定されていれば上で作った accounts.csv、無ければ inputs.csv_path（デフォルト accounts.csv）
           if [ -n "${{ github.event.inputs.ids }}" ]; then
-            CSV_PATH="accounts.csv"
+            CSV_PATH="accounts.csv"   # ← ids優先：リポのCSVは使わない
           else
             CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
           fi
+          echo "Using CSV_PATH=$CSV_PATH"
           python main.py "$CSV_PATH"
           echo "--- head of updated CSV ---"
           head -n 5 "$CSV_PATH" || true
 
-      # 9) GAS に CSV を Push（token 認証・target 指定）
       - name: Post CSV to GAS (simple token / target switch)
         if: always()
         env:
-          GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}   # 例: https://script.google.com/macros/s/XXXX/exec
-          GAS_TOKEN:    ${{ secrets.GAS_TOKEN }}      # GAS 側のトークン（GASの SHARED_TOKEN と一致）
+          GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}
+          GAS_TOKEN:    ${{ secrets.GAS_TOKEN }}
         run: |
           set -euo pipefail
           command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
 
-          # CSV パス決定
           if [ -n "${{ github.event.inputs.ids }}" ]; then
             CSV_PATH="accounts.csv"
           else
@@ -129,18 +112,14 @@ jobs:
           fi
           TARGET="${{ github.event.inputs.target || 'database' }}"
 
-          # Secrets の末尾改行/スペース除去
           GAS_ENDPOINT="$(printf '%s' "$GAS_ENDPOINT" | tr -d '\r\n' | sed 's/[[:space:]]\+$//')"
           GAS_TOKEN="$(printf '%s' "$GAS_TOKEN" | tr -d '\r\n')"
 
-          # URL エンコード
           ENC_TOKEN=$(printf '%s' "$GAS_TOKEN" | jq -sRr @uri)
           ENC_TARGET=$(printf '%s' "$TARGET" | jq -sRr @uri)
 
-          # CSV全文を JSON の csvText に詰める（改行も含めて丸ごと）
           jq -Rs '{csvText: .}' < "$CSV_PATH" > payload.json
 
-          # token と target をクエリに付与
           if echo "$GAS_ENDPOINT" | grep -q '?'; then
             URL="${GAS_ENDPOINT}&token=${ENC_TOKEN}&target=${ENC_TARGET}"
           else
@@ -154,7 +133,6 @@ jobs:
             --data-binary @payload.json)
           echo "POST HTTP $POST_CODE"
 
-          # 302 の場合、リダイレクト先をGETして応答本文も念のためログに出す
           LOC=$(grep -i '^Location:' headers.txt | awk '{print $2}' | tr -d '\r')
           if [ -n "${LOC:-}" ]; then
             GET_CODE=$(curl -sS -o response.json -w "%{http_code}" "$LOC")
@@ -167,7 +145,6 @@ jobs:
             exit 1
           fi
 
-      # 10) 生成された CSV を Artifact として保存（ダウンロード用途）
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -176,14 +153,15 @@ jobs:
           path: |
             ${{ github.event.inputs.ids && 'accounts.csv' || (github.event.inputs.csv_path || 'accounts.csv') }}
 
-      # 11) main をクリーンに保ち、変更は PR として提案
+      # ★ids 実行時はPRを出さない（リポのCSVを汚さない）
       - name: Create Pull Request
+        if: ${{ !github.event.inputs.ids }}
         uses: peter-evans/create-pull-request@v6
         with:
           commit-message: "Update accounts.csv via CI"
           title: "Update accounts.csv"
           body: "CI updated accounts.csv"
-          branch: "ci/update-accounts-csv"  # 作業用ブランチ名（固定運用）
+          branch: "ci/update-accounts-csv"
           delete-branch: true
           add-paths: |
-            ${{ github.event.inputs.ids && 'accounts.csv' || (github.event.inputs.csv_path || 'accounts.csv') }}
+            ${{ github.event.inputs.csv_path || 'accounts.csv' }}
