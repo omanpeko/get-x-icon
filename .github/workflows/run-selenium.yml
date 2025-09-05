@@ -9,6 +9,14 @@ on:
         description: 'CSV path (default: accounts.csv)'
         required: false
         default: 'accounts.csv'
+      ids:
+        description: 'Account IDs (one per line). If set, overrides csv_path.'
+        required: false
+        default: ''
+      target:
+        description: 'Where to write at GAS: "list" or "database"'
+        required: false
+        default: 'database'
   # 定期実行したいなら cron を有効化（例はUTC 03:30=JST 12:30）
   # schedule:
   #   - cron: '30 3 * * *'
@@ -63,71 +71,138 @@ jobs:
           google-chrome --version || true
           python -c "import selenium, platform; print('selenium', selenium.__version__); print(platform.platform())"
 
-      # 7) あなたの main.py を実行して CSV を更新
+      # 7) （任意）ids が与えられていたら、正規化して accounts.csv を生成
+      #    正規化ルール：
+      #     - 先頭の @ を除去
+      #     - URL (https://x.com/<id> 形式) なら最初のパスセグメントを抽出
+      #     - ? 以降のクエリを除去
+      - name: Build accounts.csv from ids (normalized if provided)
+        run: |
+          set -eux
+          IDS="${{ github.event.inputs.ids }}"
+          if [ -n "$IDS" ]; then
+            python - << 'PY'
+import sys
+from urllib.parse import urlparse
+
+raw = """${{ github.event.inputs.ids }}""".splitlines()
+
+def norm(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    if s.startswith("@"):
+        s = s[1:]
+    if s.lower().startswith(("http://", "https://")):
+        try:
+            u = urlparse(s)
+            parts = [p for p in u.path.split("/") if p]
+            if parts:
+                s = parts[0]
+        except Exception:
+            pass
+    if "?" in s:
+        s = s.split("?", 1)[0]
+    return s.strip()
+
+ids = []
+for line in raw:
+    t = norm(line)
+    if t:
+        ids.append(t)
+
+with open("accounts.csv", "w", encoding="utf-8", newline="") as f:
+    f.write("Account ID\n")
+    for x in ids:
+        f.write(f"{x}\n")
+
+print("Built accounts.csv with", len(ids), "rows")
+PY
+            echo "accounts.csv content:"
+            cat accounts.csv
+          fi
+
+      # 8) あなたの main.py を実行して CSV を更新
       - name: Run script
         env:
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}  # setup-chrome の出力
         run: |
           set -eux
-          CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
+          # ids が指定されていれば上で作った accounts.csv、無ければ inputs.csv_path（デフォルト accounts.csv）
+          if [ -n "${{ github.event.inputs.ids }}" ]; then
+            CSV_PATH="accounts.csv"
+          else
+            CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
+          fi
           python main.py "$CSV_PATH"
           echo "--- head of updated CSV ---"
           head -n 5 "$CSV_PATH"
 
-      # 8) GAS に CSV を Push
-      - name: Post CSV to GAS (simple token / no HMAC)
+      # 9) GAS に CSV を Push（token 認証・target 指定）
+      - name: Post CSV to GAS (simple token / target switch)
         if: always()
         env:
           GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}   # 例: https://script.google.com/macros/s/XXXX/exec
-          GAS_TOKEN:    ${{ secrets.GAS_TOKEN }}      # ← SHARED_TOKEN と同じ文字列
+          GAS_TOKEN:    ${{ secrets.GAS_TOKEN }}      # GAS 側のトークンと一致
         run: |
           set -euo pipefail
           command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
-      
-          CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
-          test -f "$CSV_PATH" || { echo "::error::CSV not found at $CSV_PATH"; exit 2; }
-      
+
+          # CSV パス決定
+          if [ -n "${{ github.event.inputs.ids }}" ]; then
+            CSV_PATH="accounts.csv"
+          else
+            CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
+          fi
+          TARGET="${{ github.event.inputs.target || 'database' }}"
+
+          # Secrets の末尾改行/スペース除去
           GAS_ENDPOINT="$(printf '%s' "$GAS_ENDPOINT" | tr -d '\r\n' | sed 's/[[:space:]]\+$//')"
           GAS_TOKEN="$(printf '%s' "$GAS_TOKEN" | tr -d '\r\n')"
-      
+
+          # URL エンコード
+          ENC_TOKEN=$(printf '%s' "$GAS_TOKEN" | jq -sRr @uri)
+          ENC_TARGET=$(printf '%s' "$TARGET" | jq -sRr @uri)
+
           # CSV全文を JSON の csvText に詰める（改行も含めて丸ごと）
           jq -Rs '{csvText: .}' < "$CSV_PATH" > payload.json
-      
-          # token をクエリに付ける
+
+          # token と target をクエリに付与
           if echo "$GAS_ENDPOINT" | grep -q '?'; then
-            URL="${GAS_ENDPOINT}&token=${GAS_TOKEN}"
+            URL="${GAS_ENDPOINT}&token=${ENC_TOKEN}&target=${ENC_TARGET}"
           else
-            URL="${GAS_ENDPOINT}?token=${GAS_TOKEN}"
+            URL="${GAS_ENDPOINT}?token=${ENC_TOKEN}&target=${ENC_TARGET}"
           fi
-      
-          echo "Posting to GAS..."
+
+          echo "Posting to GAS (target=${TARGET})..."
           POST_CODE=$(curl -sS -o /dev/null -D headers.txt -w "%{http_code}" \
             -X POST "$URL" \
             -H "Content-Type: application/json" \
             --data-binary @payload.json)
           echo "POST HTTP $POST_CODE"
-      
+
           LOC=$(grep -i '^Location:' headers.txt | awk '{print $2}' | tr -d '\r')
           if [ -n "${LOC:-}" ]; then
             GET_CODE=$(curl -sS -o response.json -w "%{http_code}" "$LOC")
             echo "GET HTTP $GET_CODE"
             echo "Response body:" && cat response.json || true
           fi
-      
+
           if [ "$POST_CODE" != "200" ] && [ "$POST_CODE" != "302" ]; then
             echo "::error::GAS POST returned HTTP $POST_CODE"
             exit 1
           fi
 
-      # 9) 生成された CSV を Artifact として保存（ダウンロード用途）
+      # 10) 生成された CSV を Artifact として保存（ダウンロード用途）
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: accounts.csv
-          path: ${{ github.event.inputs.csv_path || 'accounts.csv' }}
+          path: |
+            ${{ github.event.inputs.ids && 'accounts.csv' || (github.event.inputs.csv_path || 'accounts.csv') }}
 
-      # 10) main をクリーンに保ち、変更は PR として提案
+      # 11) main をクリーンに保ち、変更は PR として提案
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
@@ -137,4 +212,4 @@ jobs:
           branch: "ci/update-accounts-csv"  # 作業用ブランチ名（固定運用）
           delete-branch: true
           add-paths: |
-            ${{ github.event.inputs.csv_path || 'accounts.csv' }}
+            ${{ github.event.inputs.ids && 'accounts.csv' || (github.event.inputs.csv_path || 'accounts.csv') }}
