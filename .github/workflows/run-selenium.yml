@@ -82,42 +82,42 @@ jobs:
           IDS="${{ github.event.inputs.ids }}"
           if [ -n "$IDS" ]; then
             python - << 'PY'
-import sys
-from urllib.parse import urlparse
-
-raw = """${{ github.event.inputs.ids }}""".splitlines()
-
-def norm(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return ""
-    if s.startswith("@"):
-        s = s[1:]
-    if s.lower().startswith(("http://", "https://")):
-        try:
-            u = urlparse(s)
-            parts = [p for p in u.path.split("/") if p]
-            if parts:
-                s = parts[0]
-        except Exception:
-            pass
-    if "?" in s:
-        s = s.split("?", 1)[0]
-    return s.strip()
-
-ids = []
-for line in raw:
-    t = norm(line)
-    if t:
-        ids.append(t)
-
-with open("accounts.csv", "w", encoding="utf-8", newline="") as f:
-    f.write("Account ID\n")
-    for x in ids:
-        f.write(f"{x}\n")
-
-print("Built accounts.csv with", len(ids), "rows")
-PY
+            import sys
+            from urllib.parse import urlparse
+            
+            raw = """${{ github.event.inputs.ids }}""".splitlines()
+            
+            def norm(s: str) -> str:
+                s = (s or "").strip()
+                if not s:
+                    return ""
+                if s.startswith("@"):
+                    s = s[1:]
+                if s.lower().startswith(("http://", "https://")):
+                    try:
+                        u = urlparse(s)
+                        parts = [p for p in u.path.split("/") if p]
+                        if parts:
+                            s = parts[0]
+                    except Exception:
+                        pass
+                if "?" in s:
+                    s = s.split("?", 1)[0]
+                return s.strip()
+            
+            ids = []
+            for line in raw:
+                t = norm(line)
+                if t:
+                    ids.append(t)
+            
+            with open("accounts.csv", "w", encoding="utf-8", newline="") as f:
+                f.write("Account ID\n")
+                for x in ids:
+                    f.write(f"{x}\n")
+            
+            print("Built accounts.csv with", len(ids), "rows")
+            PY
             echo "accounts.csv content:"
             cat accounts.csv
           fi
