@@ -78,61 +78,55 @@ jobs:
       # GAS の /exec は POST すると 302 を返すのが仕様。
       # 1) まず POST（302 は成功扱い）→ Location ヘッダを拾い、
       # 2) その URL を GET して GAS 側の JSON レスポンス（status など）をログに出す。
-      - name: Post CSV to GAS (POST then capture response JSON)
-        if: always()  # 直前が失敗でも診断のため実行する。成功時だけで良いなら success() に変更可
+      - name: Post CSV to GAS (binary-safe payload)
+        if: always()
         env:
-          GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}            # 例： https://script.google.com/macros/s/xxxxx/exec
-          GAS_SHARED_SECRET: ${{ secrets.GAS_SHARED_SECRET }}  # GAS 側の SHARED_SECRET と同じ値
+          GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}
+          GAS_SHARED_SECRET: ${{ secrets.GAS_SHARED_SECRET }}
         run: |
           set -euo pipefail
-
-          # jq が無ければ入れる（大抵入っているが保険）
           command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
-
-          # 送る CSV のパスを確定
+      
           CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
           test -f "$CSV_PATH" || { echo "::error::CSV not found at $CSV_PATH"; exit 2; }
-
-          # Secrets の余計な改行や末尾スペースを除去（URL malformed 回避）
+      
+          # Secrets を整形
           GAS_ENDPOINT="$(printf '%s' "$GAS_ENDPOINT" | tr -d '\r\n' | sed 's/[[:space:]]\+$//')"
           GAS_SHARED_SECRET="$(printf '%s' "$GAS_SHARED_SECRET" | tr -d '\r\n')"
-
-          # CSV 全文を JSON の csvText に格納（改行も丸ごと）
-          JSON="$(jq -Rs '{csvText: .}' < "$CSV_PATH")"
-
-          # 本文(JSON)で HMAC-SHA256（hex）を計算（GAS の検証と一致）
-          SIG="$(printf '%s' "$JSON" | openssl dgst -sha256 -hmac "$GAS_SHARED_SECRET" -binary | xxd -p -c 256)"
-
-          # デバッグ用：ローカルでも “ping” の HMAC と 本文の SHA を出力（鍵／本文ズレの切り分け）
+      
+          # 1) JSONペイロードを "ファイル" に出力（バイトを固定化）
+          jq -Rs '{csvText: .}' < "$CSV_PATH" > payload.json
+      
+          # 2) そのファイルの"バイト列"で HMAC / SHA を計算（表示は先頭16桁だけ）
+          SIG="$(openssl dgst -sha256 -hmac "$GAS_SHARED_SECRET" -binary payload.json | xxd -p -c 256)"
+          LOCAL_BODY_SHA="$(openssl dgst -sha256 -binary payload.json | xxd -p -c 256)"
           LOCAL_HMAC_PING="$(printf 'ping' | openssl dgst -sha256 -hmac "$GAS_SHARED_SECRET" -binary | xxd -p -c 256)"
-          LOCAL_BODY_SHA="$(printf '%s' "$JSON" | openssl dgst -sha256 -binary | xxd -p -c 256)"
-
-          # 署名はクエリにも付与（GAS の e.parameter.signature で確実に拾えるよう二重化）
+      
+          # 3) 署名をクエリにも付与
           if echo "$GAS_ENDPOINT" | grep -q '?'; then
             URL="${GAS_ENDPOINT}&signature=${SIG}"
           else
             URL="${GAS_ENDPOINT}?signature=${SIG}"
           fi
-
-          echo "Posting to: $(echo "$GAS_ENDPOINT" | awk -F/ '{print $1"//"$3}')"  # ホストだけ表示（URL漏えい防止）
+      
+          echo "Posting to: $(echo "$GAS_ENDPOINT" | awk -F/ '{print $1"//"$3}') ..."
           echo "CSV bytes: $(wc -c < "$CSV_PATH")"
-          echo "Local SIG (head16): ${SIG:0:16}"            # 自分が計算した署名の先頭16桁
-          echo "Local hmacPing (head16): ${LOCAL_HMAC_PING:0:16}"  # 自分が計算した “ping” HMAC（鍵チェック）
-          echo "Local bodySha (head16): ${LOCAL_BODY_SHA:0:16}"    # 本文のハッシュ（本文差の検出）
-
-          # 1) POST（302 を追わない）→ Location を取得（GAS は 302 が正常）
+          echo "Local SIG (head16): ${SIG:0:16}"
+          echo "Local hmacPing (head16): ${LOCAL_HMAC_PING:0:16}"
+          echo "Local bodySha (head16): ${LOCAL_BODY_SHA:0:16}"
+      
+          # 4) POST は --data-binary @file で“バイトそのまま”送信（302は仕様）
           POST_CODE=$(curl -sS -o /dev/null -D headers.txt -w "%{http_code}" \
             -X POST "$URL" \
             -H "Content-Type: application/json" \
             -H "X-Signature: $SIG" \
-            --data "$JSON")
+            --data-binary @payload.json)
           echo "POST HTTP $POST_CODE"
-
-          # Location ヘッダ（リダイレクト先）を取り出し
+      
           LOC=$(grep -i '^Location:' headers.txt | awk '{print $2}' | tr -d '\r')
           echo "Location: ${LOC:-<none>}"
-
-          # 2) Location があれば GET して GAS 側の JSON を回収（ビルドIDや署名検証結果が入る想定）
+      
+          # 5) Location があれば GET でレスポンスを回収（status, build, bodySha など）
           if [ -n "${LOC:-}" ]; then
             GET_CODE=$(curl -sS -o response.json -w "%{http_code}" "$LOC")
             echo "GET HTTP $GET_CODE"
@@ -140,12 +134,13 @@ jobs:
           else
             echo "No Location header; cannot fetch JSON body (but doPost should have executed)."
           fi
-
-          # 200/302 を成功扱い（/exec は通常 302。200 も稀にある）
+      
+          # 200/302 を成功扱い
           if [ "$POST_CODE" != "200" ] && [ "$POST_CODE" != "302" ]; then
             echo "::error::GAS POST returned HTTP $POST_CODE"
             exit 1
           fi
+
 
       # 成果物として CSV を Artifact に保存（ダウンロード用）
       - name: Upload artifact
