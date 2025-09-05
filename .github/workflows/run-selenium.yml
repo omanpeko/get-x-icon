@@ -8,8 +8,9 @@ run-name: "Run by ${{ github.actor }} • ${{ github.event_name }}"
 
 # =========================================================
 # トリガ（手動実行）
-#   - ids が指定されたら「シート起動モード」とみなす
+#   - ids が指定されたら「シート起動モード」
 #   - ids が空なら「リポ内CSV運用モード」
+#   ※ どちらでも最終出力は「データベース」に固定
 # =========================================================
 on:
   workflow_dispatch:
@@ -22,13 +23,7 @@ on:
         description: "Account IDs (one per line). If set, overrides csv_path."
         required: false
         default: ""
-      target:
-        description: 'Where to write at GAS: "list" or "database"'
-        required: false
-        default: "database"
-  # 定期実行したい場合は有効化（UTC）
-  # schedule:
-  #   - cron: "30 3 * * *"  # JST 12:30
+      # target 入力は使わない（常に database に固定するため）
 
 jobs:
   run:
@@ -99,8 +94,7 @@ jobs:
       # ---------------------------------------------------
       # [STEP 7] シート起動モード（ids あり）のみ：
       #          受け取った ids から accounts.csv を生成
-      #          ※ 正規化（@除去・URL→ID抽出など）は GAS 側が担当。
-      #             ここでは空行除去と前後空白トリムのみ実施。
+      #          ※ 正規化は GAS 側。ここでは空行除去＆トリムのみ。
       # ---------------------------------------------------
       - name: Build accounts.csv from ids (no normalization, no Python)
         run: |
@@ -144,11 +138,10 @@ jobs:
           head -n 5 "$CSV_PATH" || true
 
       # ---------------------------------------------------
-      # [STEP 9] GAS に CSV を Push（token 認証／target 指定）
-      #          ids あり（シート起動）は target を list に固定（保険）
-      #          ids なし（リポCSV運用）は target 入力（未指定なら database）
+      # [STEP 9] GAS に CSV を Push（token 認証）
+      #          ※ 常に target=database を使用（「データベース」だけ更新）
       # ---------------------------------------------------
-      - name: Post CSV to GAS (token + target)
+      - name: Post CSV to GAS (always target=database)
         if: always()
         env:
           GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}   # Webアプリの /exec
@@ -159,13 +152,14 @@ jobs:
           # CSV の場所を確定
           if [ -n "${{ github.event.inputs.ids }}" ]; then
             CSV_PATH="accounts.csv"
-            TARGET="list"   # シート起動は list へ（B列更新）
           else
             CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
-            TARGET="${{ github.event.inputs.target || 'database' }}"
           fi
 
-          # jq が無い環境向け対策（Ubuntu には基本未プリインストール）
+          # ここで出力先を database に固定
+          TARGET="database"
+
+          # jq が無い環境向け対策
           command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
 
           # Secrets の余分な改行/空白を除去
@@ -179,7 +173,7 @@ jobs:
           # CSV全文を JSON の csvText に詰める（改行も含め丸ごと）
           jq -Rs '{csvText: .}' < "$CSV_PATH" > payload.json
 
-          # token と target をクエリに付けて叩く
+          # token と target=database をクエリに付けて叩く
           if echo "$GAS_ENDPOINT" | grep -q '?'; then
             URL="${GAS_ENDPOINT}&token=${ENC_TOKEN}&target=${ENC_TARGET}"
           else
@@ -219,6 +213,7 @@ jobs:
 
       # ---------------------------------------------------
       # [STEP 11] PR 作成（ids が空の時＝リポCSV運用モードのみ）
+      #           ※ データベース出力固定でも、csv_path 運用時はリポのCSV変更をPRで提案
       # ---------------------------------------------------
       - name: Create Pull Request (only when csv_path mode)
         if: ${{ !github.event.inputs.ids }}
