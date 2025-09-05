@@ -78,7 +78,7 @@ jobs:
       # GAS の /exec は POST すると 302 を返すのが仕様。
       # 1) まず POST（302 は成功扱い）→ Location ヘッダを拾い、
       # 2) その URL を GET して GAS 側の JSON レスポンス（status など）をログに出す。
-      - name: Post CSV to GAS (binary-safe payload)
+      - name: Post CSV to GAS (sign CSV only / binary-safe)
         if: always()
         env:
           GAS_ENDPOINT: ${{ secrets.GAS_ENDPOINT }}
@@ -90,43 +90,37 @@ jobs:
           CSV_PATH="${{ github.event.inputs.csv_path || 'accounts.csv' }}"
           test -f "$CSV_PATH" || { echo "::error::CSV not found at $CSV_PATH"; exit 2; }
       
-          # Secrets を整形
           GAS_ENDPOINT="$(printf '%s' "$GAS_ENDPOINT" | tr -d '\r\n' | sed 's/[[:space:]]\+$//')"
           GAS_SHARED_SECRET="$(printf '%s' "$GAS_SHARED_SECRET" | tr -d '\r\n')"
       
-          # 1) JSONペイロードを "ファイル" に出力（バイトを固定化）
+          # 1) CSVそのもののバイト列で HMAC-SHA256 を計算（hex）
+          SIG_CSV="$(openssl dgst -sha256 -hmac "$GAS_SHARED_SECRET" -binary "$CSV_PATH" | xxd -p -c 256)"
+      
+          # 2) JSON ペイロードをファイルに出力（csvTextにCSV全文を入れる）
           jq -Rs '{csvText: .}' < "$CSV_PATH" > payload.json
       
-          # 2) そのファイルの"バイト列"で HMAC / SHA を計算（表示は先頭16桁だけ）
-          SIG="$(openssl dgst -sha256 -hmac "$GAS_SHARED_SECRET" -binary payload.json | xxd -p -c 256)"
-          LOCAL_BODY_SHA="$(openssl dgst -sha256 -binary payload.json | xxd -p -c 256)"
-          LOCAL_HMAC_PING="$(printf 'ping' | openssl dgst -sha256 -hmac "$GAS_SHARED_SECRET" -binary | xxd -p -c 256)"
-      
-          # 3) 署名をクエリにも付与
+          # 3) 署名はヘッダ `X-Signature-Csv` に付ける（本文JSONの差異に影響されない）
+          #    /exec は POST 後に 302 を返すのが仕様。302は成功扱いにしてLocationをGETで本文取得。
           if echo "$GAS_ENDPOINT" | grep -q '?'; then
-            URL="${GAS_ENDPOINT}&signature=${SIG}"
+            URL="${GAS_ENDPOINT}"
           else
-            URL="${GAS_ENDPOINT}?signature=${SIG}"
+            URL="${GAS_ENDPOINT}"
           fi
       
           echo "Posting to: $(echo "$GAS_ENDPOINT" | awk -F/ '{print $1"//"$3}') ..."
           echo "CSV bytes: $(wc -c < "$CSV_PATH")"
-          echo "Local SIG (head16): ${SIG:0:16}"
-          echo "Local hmacPing (head16): ${LOCAL_HMAC_PING:0:16}"
-          echo "Local bodySha (head16): ${LOCAL_BODY_SHA:0:16}"
+          echo "CSV SIG (head16): ${SIG_CSV:0:16}"
       
-          # 4) POST は --data-binary @file で“バイトそのまま”送信（302は仕様）
           POST_CODE=$(curl -sS -o /dev/null -D headers.txt -w "%{http_code}" \
             -X POST "$URL" \
             -H "Content-Type: application/json" \
-            -H "X-Signature: $SIG" \
+            -H "X-Signature-Csv: $SIG_CSV" \
             --data-binary @payload.json)
           echo "POST HTTP $POST_CODE"
       
           LOC=$(grep -i '^Location:' headers.txt | awk '{print $2}' | tr -d '\r')
           echo "Location: ${LOC:-<none>}"
       
-          # 5) Location があれば GET でレスポンスを回収（status, build, bodySha など）
           if [ -n "${LOC:-}" ]; then
             GET_CODE=$(curl -sS -o response.json -w "%{http_code}" "$LOC")
             echo "GET HTTP $GET_CODE"
@@ -135,11 +129,11 @@ jobs:
             echo "No Location header; cannot fetch JSON body (but doPost should have executed)."
           fi
       
-          # 200/302 を成功扱い
           if [ "$POST_CODE" != "200" ] && [ "$POST_CODE" != "302" ]; then
             echo "::error::GAS POST returned HTTP $POST_CODE"
             exit 1
           fi
+
 
 
       # 成果物として CSV を Artifact に保存（ダウンロード用）
